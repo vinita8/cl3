@@ -1,0 +1,765 @@
+03
+_bronze_profiling - SME Presentation Transcript
+Opening transcript
+
+“Now I’ll explain our third Bronze-layer notebook, which performs data profiling.
+
+In the previous notebooks, we ingested the master data from Azure SQL and the operational CSV data into Bronze Delta tables.
+
+In this notebook, we perform read-only profiling across all six datasets to understand the actual quality and characteristics of the data before applying Silver-layer transformations.
+
+We analyze row counts, null values, missing and duplicate business keys, exact duplicate rows, categorical distributions, numeric ranges and percentiles, timestamp quality, chronology, and referential integrity.
+
+An important point is that this notebook only identifies and reports observations. It does not modify, clean, deduplicate, quarantine, or delete any records. Those decisions are made later based on agreed Silver-layer business rules.”
+
+That is exactly the intended role of this notebook.
+
+Cell 1: Catalog and schema widgets
+Python
+dbutils.widgets.text("catalog", "capstone_3flight", "Catalog")
+dbutils.widgets.text("schema", "flight_schema", "Schema")
+ 
+CATALOG = dbutils.widgets.get("catalog").strip()
+SCHEMA = dbutils.widgets.get("schema").strip()
+ 
+if not CATALOG or not SCHEMA:
+raise ValueError("Both catalog and schema widget values are required.")
+ 
+SCHEMA_NAME = f"`{CATALOG}`.`{SCHEMA}`"
+ 
+print("Catalog:", CATALOG)
+print("Schema :", SCHEMA)
+Transcript
+
+“In the first cell, we parameterize the notebook by creating widgets for catalog and schema.
+
+The default values are capstone_3flight and flight_schema.
+
+We retrieve those widget values using dbutils.widgets.get() and use .strip() to remove any accidental leading or trailing spaces.
+
+We then validate that neither value is empty. If either is missing, we raise a ValueError and stop execution.
+
+Finally, we construct SCHEMA_NAME, which will be reused while accessing the tables.
+
+Using widgets makes the notebook more configurable because these values can be changed during manual execution or provided as parameters when the notebook runs through a Databricks Workflow.”
+
+SME: Why widgets instead of hardcoding?
+
+“Widgets make the notebook reusable. If we need to execute the same profiling logic against another catalog or schema, we can provide different parameters instead of modifying the code.”
+
+Cell 2: Define the six tables and business keys
+Python
+TABLES = {
+"flight_schedules": {
+"name": "bronze_flight_schedules",
+"key": "flight_id",
+},
+"flight_movement_events": {
+"name": "bronze_flight_movement_events",
+"key": "movement_event_id",
+},
+"weather_observations": {
+"name": "bronze_weather_observations",
+"key": "weather_observation_id",
+},
+"aircraft_master": {
+"name": "aircraft_master",
+"key": "aircraft_id",
+},
+"airline_master": {
+"name": "airline_master",
+"key": "airline_id",
+},
+"airport_master": {
+"name": "airport_master",
+"key": "airport_id",
+},
+}
+ 
+def full_table_name(table_name):
+return f"{SCHEMA_NAME}.`{table_name}`"
+ 
+for dataset, details in TABLES.items():
+table_name = full_table_name(details["name"])
+ 
+if not spark.catalog.tableExists(table_name):
+raise RuntimeError(
+f"Required table is missing: {CATALOG}.{SCHEMA}.{details['name']}. "
+"Run the relevant ingestion notebook first."
+)
+ 
+print(f"PASS | Found {table_name}")
+Transcript
+
+“Here we define the six datasets that we are going to profile along with their respective business keys.
+
+The three operational Bronze datasets use flight_id, movement_event_id, and weather_observation_id.
+
+The three reference datasets use aircraft_id, airline_id, and airport_id.
+
+We then define the reusable full_table_name() function, which constructs the fully qualified table name.
+
+Before profiling begins, we loop through all six tables and use spark.catalog.tableExists() to confirm that each required table exists.
+
+If any table is missing, the notebook deliberately stops instead of giving incomplete profiling results.”
+
+SME: What is a business key?
+
+“A business key is the column used to identify a business record within that dataset. For example, flight_id identifies a flight schedule record according to the dataset contract.”
+
+Cell 3: Read tables and calculate row counts
+Python
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+import json
+ 
+dataframes = {}
+row_count_results = []
+ 
+for dataset, details in TABLES.items():
+df = spark.table(full_table_name(details["name"]))
+dataframes[dataset] = df
+ 
+row_count_results.append(
+(dataset, details["name"], df.count(), len(df.columns))
+)
+ 
+row_count_df = spark.createDataFrame(
+row_count_results,
+["dataset", "table_name", "row_count", "column_count"]
+)
+ 
+display(row_count_df)
+Transcript
+
+“In this cell, we read all six tables and establish our basic profiling metrics.
+
+We import PySpark functions as F, PySpark types as T, and Python's json module.
+
+dataframes is a dictionary where we store each dataset's Spark DataFrame so that later profiling cells can reuse it.
+
+row_count_results stores the profiling results.
+
+For every dataset, we read the table using spark.table(), calculate the number of rows using df.count(), and calculate the number of columns using len(df.columns).
+
+Finally, we create and display a DataFrame containing dataset name, table name, row count, and column count.”
+
+Cell 4: NULL profiling
+Python
+null_results = []
+ 
+for dataset, df in dataframes.items():
+total_rows = df.count()
+ 
+if total_rows == 0:
+for column_name in df.columns:
+null_results.append((dataset, column_name, 0, 0.0))
+continue
+ 
+expressions = [
+F.sum(F.when(F.col(column_name).isNull(), 1).otherwise(0))
+.alias(column_name)
+for column_name in df.columns
+]
+ 
+counts = df.agg(*expressions).first().asDict()
+ 
+for column_name in df.columns:
+null_count = int(counts[column_name] or 0)
+null_percent = round((null_count / total_rows) * 100, 2)
+ 
+null_results.append(
+(dataset, column_name, null_count, null_percent)
+)
+ 
+null_profile = spark.createDataFrame(
+null_results,
+["dataset", "column_name", "null_count", "null_percent"]
+)
+ 
+display(
+null_profile
+.filter(F.col("null_count") > 0)
+.orderBy("dataset", F.desc("null_count"))
+)
+Transcript
+
+“Next, we perform column-level null profiling across every dataset.
+
+For each DataFrame, we determine its total number of rows.
+
+Then, for every column, we use isNull() to identify null values and aggregate their count.
+
+Once the counts are available, we calculate the null percentage as null count divided by total rows multiplied by 100.
+
+We create null_profile, containing the dataset, column name, null count, and null percentage.
+
+For easier analysis, the final display shows only columns having at least one null and orders them by their null count.
+
+Importantly, we don't automatically classify every null as a data-quality defect. Profiling tells us where nulls exist. Whether that is actually invalid depends on whether the business considers that particular field mandatory or optional.”
+
+Very important SME question
+
+If _rescued_data is NULL in all 603 rows, what does it mean?
+
+“It means none of those 603 records needed data to be stored in _rescued_data. It does not mean that every other column in those 603 records is non-null.”
+
+Cell 5: Business-key profiling
+Python
+key_results = []
+ 
+for dataset, details in TABLES.items():
+df = dataframes[dataset]
+key_column = details["key"]
+ 
+if key_column not in df.columns:
+raise RuntimeError(
+f"Expected business key '{key_column}' is missing "
+f"from {details['name']}."
+)
+ 
+total_rows = df.count()
+ 
+null_keys = df.filter(F.col(key_column).isNull()).count()
+ 
+distinct_keys = df.select(key_column).where(
+F.col(key_column).isNotNull()
+).distinct().count()
+ 
+duplicate_key_values = (
+df.where(F.col(key_column).isNotNull())
+.groupBy(key_column)
+.count()
+.filter(F.col("count") > 1)
+.count()
+)
+ 
+duplicate_key_rows = (
+df.where(F.col(key_column).isNotNull())
+.groupBy(key_column)
+.count()
+.filter(F.col("count") > 1)
+.agg(F.sum("count"))
+.first()[0]
+) or 0
+ 
+key_results.append((
+dataset, key_column, total_rows, null_keys, distinct_keys,
+duplicate_key_values, int(duplicate_key_rows)
+))
+ 
+key_profile = spark.createDataFrame(
+key_results,
+[
+"dataset", "business_key", "total_rows", "null_key_rows",
+"distinct_non_null_keys", "duplicate_key_values",
+"rows_with_duplicate_keys"
+]
+)
+ 
+display(key_profile)
+Transcript
+
+“This is one of our key data-quality profiling checks.
+
+For every dataset, we first verify that its expected business-key column actually exists.
+
+We then calculate the total rows and count how many records have a null business key.
+
+Next, we calculate the number of distinct non-null business keys.
+
+After that, we group records by business key and identify keys whose count is greater than one.
+
+duplicate_key_values tells us how many unique key values are repeated.
+
+rows_with_duplicate_keys tells us how many total records belong to those repeated-key groups.
+
+Again, we are only reporting duplicate business keys here. We are not deleting records or deciding which record should survive.”
+
+Your earlier 37 and 74 example
+
+If the output shows:
+
+duplicate_key_values = 37
+
+rows_with_duplicate_keys = 74
+
+Say:
+
+“37 different business-key values occur more than once, and there are 74 total records belonging to those duplicated-key groups.”
+
+For example:
+
+Plain Text
+F001 → 2 records
+F002 → 2 records
+...
+
+If 37 IDs each appear twice:
+
+37 duplicated IDs × 2 records = 74 rows
+
+But do not automatically say there are 37 extra rows, because a duplicated key group could contain more than two records.
+
+Cell 6: Exact duplicate rows
+Python
+exact_duplicate_results = []
+ 
+for dataset, df in dataframes.items():
+if not df.columns:
+exact_duplicate_results.append((dataset, 0))
+continue
+ 
+grouped_rows = (
+df.groupBy(*[F.col(column_name) for column_name in df.columns])
+.count()
+.filter(F.col("count") > 1)
+)
+ 
+extra_copies = (
+grouped_rows
+.select(F.sum(F.col("count") - 1).alias("extra_copies"))
+.first()["extra_copies"]
+) or 0
+ 
+exact_duplicate_results.append((dataset, int(extra_copies)))
+ 
+exact_duplicate_profile = spark.createDataFrame(
+exact_duplicate_results,
+["dataset", "extra_exact_duplicate_rows"]
+)
+ 
+display(exact_duplicate_profile)
+Transcript
+
+“Here we distinguish duplicate business keys from exact duplicate rows.
+
+We group the DataFrame using every column. Therefore, records are considered exact duplicates only when all column values are identical.
+
+For groups occurring more than once, we calculate count - 1.
+
+We subtract one because the first occurrence is considered the original record, while only the additional copies are counted as extra duplicates.
+
+For example, if one identical row occurs three times, 3 - 1 gives two extra duplicate copies.
+
+The important distinction is that two records may have the same business key but different values in other columns. In that case, they are duplicate business keys but not exact duplicate rows.”
+
+Best one-line answer
+
+“Business-key duplicate means the identifier repeats; exact duplicate means the complete row repeats.”
+
+Cell 7: Category distribution
+Python
+CATEGORY_COLUMNS = {
+"flight_schedules": [
+"flight_status",
+],
+"flight_movement_events": [
+"movement_type", "event_source", "delay_reason",
+],
+"weather_observations": [
+"weather_condition", "quality_flag",
+],
+"aircraft_master": [
+"aircraft_type", "manufacturer", "fleet_status", "engine_type",
+],
+"airline_master": [
+"home_country", "operating_region", "carrier_type",
+"active_flag", "alliance",
+],
+"airport_master": [
+"country", "airport_class", "active_flag", "timezone",
+],
+}
+ 
+category_results = []
+ 
+for dataset, column_list in CATEGORY_COLUMNS.items():
+df = dataframes[dataset]
+ 
+for column_name in column_list:
+if column_name in df.columns:
+top_values = (
+df.groupBy(column_name)
+.count()
+.orderBy(F.desc("count"))
+.limit(20)
+.withColumn("dataset", F.lit(dataset))
+.withColumn("column_name", F.lit(column_name))
+.select(
+"dataset", "column_name",
+F.col(column_name).cast("string").alias("category_value"),
+F.col("count").alias("row_count")
+)
+)
+ 
+category_results.append(top_values)
+ 
+if category_results:
+category_profile = category_results[0]
+ 
+for result in category_results[1:]:
+category_profile = category_profile.unionByName(result)
+ 
+display(category_profile.orderBy("dataset", "column_name", F.desc("row_count")))
+else:
+print("No selected category columns were found.")
+Transcript
+
+“Next, we analyze the distribution of selected categorical attributes.
+
+CATEGORY_COLUMNS defines the important categorical columns for each dataset.
+
+For every available column, we group records by the category value and calculate its frequency.
+
+We order frequencies in descending order and keep the top 20 values for each selected column.
+
+We also attach the dataset name and column name to each result. Finally, unionByName() combines the individual results into one profiling DataFrame.
+
+This helps us identify common category values, null categories, unusual values, or values that may later need business validation.”
+
+Important: Why can the output have more than 20 rows?
+
+“Because .limit(20) applies separately to every categorical column. It does not limit the entire final output to 20 rows.”
+
+So if you profile:
+
+1 column → up to 20
+2 columns → up to 40
+5 columns → up to 100
+
+before considering that some columns may have fewer than 20 distinct categories.
+
+Cell 8: Numeric profiling and percentiles
+Python
+NUMERIC_COLUMNS = {
+"flight_schedules": ["route_distance_km", "schedule_version"],
+"flight_movement_events": ["event_sequence"],
+"weather_observations": [
+"temperature_c", "visibility_km", "wind_speed_kmh",
+"precipitation_mm",
+],
+"aircraft_master": [
+"seat_capacity", "manufacture_year", "range_km", "fleet_size",
+],
+"airline_master": ["fleet_size"],
+"airport_master": ["latitude", "longitude"],
+}
+ 
+numeric_results = []
+ 
+for dataset, column_list in NUMERIC_COLUMNS.items():
+df = dataframes[dataset]
+ 
+for column_name in column_list:
+if column_name not in df.columns:
+continue
+ 
+numeric_df = df.select(
+F.col(column_name).cast("double").alias("numeric_value")
+).where(F.col("numeric_value").isNotNull())
+ 
+stats = numeric_df.agg(
+F.min("numeric_value").alias("minimum"),
+F.max("numeric_value").alias("maximum"),
+F.avg("numeric_value").alias("average"),
+).first()
+ 
+percentiles = numeric_df.approxQuantile(
+"numeric_value", [0.25, 0.50, 0.75], 0.01
+)
+ 
+p25 = percentiles[0] if len(percentiles) > 0 else None
+p50 = percentiles[1] if len(percentiles) > 1 else None
+p75 = percentiles[2] if len(percentiles) > 2 else None
+ 
+numeric_results.append((
+dataset, column_name, stats["minimum"], stats["maximum"],
+stats["average"], p25, p50, p75
+))
+ 
+numeric_profile = spark.createDataFrame(
+numeric_results,
+[
+"dataset", "column_name", "minimum", "maximum", "average",
+"p25", "p50_median", "p75"
+]
+)
+ 
+display(numeric_profile)
+Transcript
+
+“This cell performs numeric profiling.
+
+We first define the numeric attributes that are important for each dataset.
+
+Each selected value is cast to double for profiling purposes. This does not modify the original Bronze table.
+
+We calculate minimum, maximum, and average values.
+
+We then use approxQuantile() to calculate the 25th percentile, median or 50th percentile, and 75th percentile.
+
+The final output enables us to understand the normal range and distribution of numerical values and helps us identify potentially unusual extremes for further investigation.”
+
+Memorize P25/P50/P75
+
+P25: approximately 25% of observations are at or below this value.
+
+P50: median. Approximately 50% are at or below it.
+
+P75: approximately 75% are at or below it.
+
+The 0.01 in your code is the relative error parameter used by approxQuantile().
+
+Cell 9: Timestamp profiling and chronology
+
+The cell does two different checks: timestamp parsing and chronological relationships.
+
+Main transcript
+
+“Next, we profile timestamp quality.
+
+We define the timestamp columns we want to inspect and use to_timestamp() to attempt to parse each one.
+
+We specifically count records where the original value is non-null but the parsed value becomes null. Those represent non-null values that could not be interpreted as timestamps.
+
+After checking parseability, we perform basic chronology observations.
+
+For flight schedules, we compare scheduled arrival with scheduled departure and count cases where arrival is at or before departure.
+
+For movement events, we compare event time and reported time and count records where the report was received after the event.
+
+Importantly, these chronology results are observations rather than automatic rejection rules. For example, a report occurring after the actual event may simply represent reporting latency.”
+
+SME: Is reported_ts > event_ts necessarily bad?
+
+“No. The notebook explicitly treats this as something to investigate because a later report timestamp may simply indicate reporting latency.”
+
+Cell 10: Referential integrity and orphan records
+
+This is another very important SME cell.
+
+Transcript
+
+“Next, we validate referential integrity between operational datasets and their related reference datasets.
+
+We define a reusable function called check_reference_coverage.
+
+The source column represents a foreign key, while the reference column represents the corresponding key in the reference dataset.
+
+We separately calculate null foreign keys and orphan foreign keys.
+
+A null foreign key means that the source doesn't contain an ID for that record.
+
+An orphan foreign key means that an ID exists in the source, but that ID cannot be found in the corresponding reference dataset.
+
+To identify orphans, we use a left_anti join. This returns source values that do not have a matching value in the reference dataset.
+
+We apply this check to schedule-airline, schedule-aircraft, schedule-airports, movement-flight, movement-airport, and weather-airport relationships.
+
+Finally, we display how many source rows were checked, how many foreign keys were null, and how many were orphaned.”
+
+Example you should memorize
+
+Suppose:
+
+Plain Text
+source_rows_checked = 603
+null_foreign_keys = 0
+orphan_foreign_keys = 0
+
+Say:
+
+“All 603 source rows were checked. None had a null foreign key, and none of the non-null IDs were missing from the referenced dataset.”
+
+SME: Why left anti join?
+
+“Because a left anti join returns records from the left side that have no matching record on the right side, which makes it suitable for identifying orphan foreign keys.”
+
+Cell 11: Summary generation
+Python
+# A compact observation summary from the profiles already calculated.
+summary = {
+"catalog": CATALOG,
+"schema": SCHEMA,
+"tables_profiled": len(TABLES),
+"total_rows_profiled": int(sum(row[2] for row in row_count_results)),
+"datasets": {
+row[0]: {
+"table": row[1],
+"row_count": int(row[2]),
+"column_count": int(row[3]),
+}
+for row in row_count_results
+},
+"business_key_checks": [
+{
+"dataset": row["dataset"],
+"null_key_rows": int(row["null_key_rows"]),
+"duplicate_key_values": int(row["duplicate_key_values"]),
+}
+for row in key_profile.collect()
+],
+}
+ 
+print(json.dumps(summary, indent=2))
+Transcript
+
+“After completing detailed profiling, we create a compact summary of the important results.
+
+The summary Python dictionary contains our catalog, schema, number of tables profiled, and total rows profiled.
+
+Under datasets, we store the table name, row count, and column count for each dataset.
+
+Under business_key_checks, we collect the null business-key count and duplicate-key count for every dataset.
+
+key_profile.collect() brings the relatively small profiling result back to the driver so that we can construct this Python summary.
+
+Finally, we use json.dumps() to convert the Python dictionary into a JSON-formatted string for display.”
+
+SME: Why indent=2?
+
+“indent=2 only makes the printed JSON easier for humans to read by formatting nested levels with two spaces. It doesn't change the underlying information.”
+
+Where did row_count_results come from?
+
+“It was created in the earlier row-count profiling cell.”
+
+Where did key_profile come from?
+
+“It was created in our business-key profiling cell.”
+
+Cell 12: Publish Workflow task value
+Python
+summary_json = json.dumps(summary, default=str)
+ 
+try:
+dbutils.jobs.taskValues.set(
+key="bronze_profiling_summary",
+value=summary_json
+)
+print("PASS | Published task value: bronze_profiling_summary")
+except Exception as error:
+print(
+"INFO | Task values were not published in this run. "
+"This is expected in some interactive contexts."
+)
+print("Reason:", str(error))
+ 
+print("Bronze profiling completed.")
+Transcript
+
+“In this cell, we prepare the profiling summary for use by downstream Databricks Workflow tasks.
+
+First, json.dumps() converts the summary dictionary into a JSON string.
+
+We then use dbutils.jobs.taskValues.set() with the key bronze_profiling_summary.
+
+When this notebook is executed as part of a Databricks Workflow, another downstream task can retrieve this task value and use the compact profiling summary.
+
+We wrap this operation in try-except because task values may not be available in some interactive execution contexts.
+
+So if publishing isn't available, we provide an informational message rather than treating it as failure of the profiling itself.
+
+Finally, we print that Bronze profiling has completed.”
+
+Very important distinction
+
+The task value is not your complete profiling result.
+
+“It is only a compact summary for downstream Workflow communication. The detailed profiling outputs displayed earlier are not persisted into Delta tables by this notebook.”
+
+Cell 13: Final handoff to Silver
+Transcript
+
+“At this point, our Bronze profiling is complete.
+
+We have gathered evidence about null values, business-key duplicates, exact duplicates, category distributions, numeric ranges, timestamp quality, chronology, and referential integrity.
+
+However, profiling itself doesn't decide how these issues should be handled.
+
+Before applying Silver transformations, these observations should be reviewed against the agreed business rules.
+
+Only after that should we decide whether particular records need cleaning, deduplication, standardization, rejection, or quarantine.
+
+So Bronze profiling gives us the evidence, while the Silver layer applies the approved data-quality and transformation rules.”
+
+Most important SME distinction
+
+If your SME asks:
+
+“If you identified duplicate records, why didn't you remove them here?”
+
+Answer:
+
+“Because this is a profiling notebook, not a transformation notebook. Bronze preserves the source data. Here we identify and quantify potential issues. We don't automatically assume that every duplicate business key is invalid. We first establish the evidence and business rule, and the approved handling is then implemented in Silver.”
+
+That idea is explicitly stated throughout 03_bronze_profiling.
+
+Quick SME counter-question revision
+SME asks	Your answer
+What is profiling?	Understanding the characteristics and quality of the data before transformations.
+Are you modifying Bronze?	No, this notebook is read-only.
+Business-key duplicate vs exact duplicate?	Business-key duplicate means the identifier repeats; exact duplicate means every column in the row repeats.
+What is P50?	Median.
+Why approximate quantile?	To calculate approximate percentiles efficiently in Spark.
+What is an orphan?	A non-null foreign key for which no matching reference key exists.
+Why left anti join?	To return source values without matches in the reference dataset.
+Does NULL automatically mean bad data?	No. It depends on whether the attribute is mandatory.
+Does duplicate automatically mean bad data?	No. It requires investigation/business rules.
+Are we quarantining here?	No.
+Are we deduplicating here?	No.
+Why JSON?	To create a compact, structured summary that can be passed downstream.
+What is the task-value key?	bronze_profiling_summary.
+Final 2-minute transcript to memorize
+
+If you have very little time, memorize this version:
+
+“This is our third Bronze notebook, which performs read-only profiling across our three operational Bronze datasets and three reference datasets.
+
+First, we parameterize the catalog and schema using widgets and confirm that all six required tables exist.
+
+Then we read the tables and capture their row and column counts.
+
+Our first quality check is null profiling, where we calculate the null count and percentage for every column.
+
+Next, we profile the business keys. We identify null keys, distinct keys, repeated key values, and the total rows belonging to duplicate-key groups.
+
+We separately check exact duplicates because a repeated business key doesn't necessarily mean the complete records are identical.
+
+We then analyze categorical distributions and profile numeric columns using minimum, maximum, average, P25, median, and P75.
+
+After that, we validate timestamp parsing and perform basic chronology observations.
+
+We also check referential integrity using a left anti join to identify orphan IDs, while reporting null foreign keys separately.
+
+Finally, we build a compact JSON profiling summary and publish it as the Workflow task value bronze_profiling_summary so that downstream Workflow tasks can consume the summary.
+
+The key point is that this notebook only provides profiling evidence. We don't delete duplicates, replace nulls, quarantine records, or apply business transformations here. Those actions depend on agreed business rules and belong in the Silver layer.”
+
+Your handover to Malar
+
+Since Malar is presenting Silver after you, once you finish this third notebook, say:
+
+“So with this, I have completed the Bronze layer. We started by ingesting our reference master data from Azure SQL, then incrementally ingested the operational CSV datasets using Auto Loader, and finally profiled both the Bronze and reference datasets to understand data quality before applying downstream transformations. The Bronze layer intentionally preserves the source data, while the profiling results provide the evidence required to define our Silver-layer rules. Now I’ll hand over to Malar, who will take you through the Silver layer and explain how these datasets are cleaned, validated, and transformed for further processing.”
+
+That gives you a clean story across all three notebooks: Azure SQL reference ingestion → Auto Loader operational ingestion → Bronze profiling → Silver handoff.
+
+
+
+CONCLUSION
+
+
+“To conclude, our Aviation Flight Operations project demonstrates an end-to-end data engineering solution using the Medallion Architecture with Bronze, Silver, and Gold layers.
+
+We started by integrating data from two different source systems. The reference data, including aircraft, airline, and airport information, was ingested from Azure SQL, while the operational data, including flight schedules, flight movement events, and weather observations, was ingested from ADLS Gen2.
+
+In the Bronze layer, our focus was on preserving the source data in Delta tables along with the available ingestion and lineage information. We then profiled the datasets to understand data-quality conditions before applying transformations.
+
+In the Silver layer, the data was cleaned, validated, and standardized. As part of our data-quality processing, 74 conflicting schedule records across 37 flight IDs were identified and quarantined, while validated records were taken forward for downstream processing.
+
+The validated data was then transformed in the Gold layer into business-ready dimensions, fact tables, and KPI aggregates. These analytical datasets support reporting on flight operations, airport performance, delays, cancellations, fleet capacity, and weather conditions.
+
+So overall, the project provides a complete flow from source-data ingestion and quality validation to business-ready analytics, while maintaining traceability across the different layers.
+
+With that, we conclude our presentation. Thank you.”

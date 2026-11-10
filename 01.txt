@@ -1,0 +1,272 @@
+01
+_azure_sql_ingestion - Presentation Transcript
+Opening
+
+Say:
+
+“Now I’ll explain our first Bronze-layer notebook, which is responsible for ingesting our master or reference datasets from Azure SQL into Databricks.
+
+We have three reference datasets: aircraft master, airline master, and airport master. We connect Databricks to Azure SQL using JDBC, securely retrieve the credentials from Databricks Secret Scope, load the source tables into Spark DataFrames, and finally persist them as Delta tables in our Databricks catalog.”
+
+This matches the notebook’s three JDBC reads and final Delta writes.
+
+Cell 1: Read aircraft_master
+Python
+# Databricks notebook source
+# DBTITLE 1,Read aircraft_master from Azure SQL
+# Credentials are read from the Databricks secret scope "capstone3" (never typed in code).
+SECRET_SCOPE = "capstone3"
+sql_user = dbutils.secrets.get(scope=SECRET_SCOPE, key="sql-user")
+sql_password = dbutils.secrets.get(scope=SECRET_SCOPE, key="sql-password")
+jdbc_url = (
+"jdbc:sqlserver://capstone3server.database.windows.net:1433;"
+"database=capstone3;"
+"encrypt=true;"
+"trustServerCertificate=false;"
+"hostNameInCertificate=*.database.windows.net;"
+"loginTimeout=30;"
+)
+try:
+aircraft_df = (spark.read
+.format("jdbc")
+.option("url", jdbc_url)
+.option("dbtable", "dbo.aircraft_master")
+.option("user", sql_user)
+.option("password", sql_password)
+.option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")
+.load())
+display(aircraft_df)
+except Exception as e:
+print(str(e)[:2000])
+Transcript
+
+“In the first cell, we are ingesting the aircraft master reference data from Azure SQL into Databricks.
+
+First, we define our Databricks Secret Scope as capstone3. Instead of hardcoding the Azure SQL username and password directly in the notebook, we retrieve them securely using dbutils.secrets.get().
+
+The keys sql-user and sql-password identify the corresponding secrets stored inside the secret scope.
+
+Next, we create the JDBC connection URL. Here, capstone3server.database.windows.net is the Azure SQL Server endpoint, 1433 is the SQL Server port, and capstone3 is the database.
+
+We have also enabled encrypted communication using encrypt=true. trustServerCertificate=false means that we don't simply trust any server certificate. The hostname is validated against the Azure SQL certificate.
+
+After configuring the connection, we use spark.read.format("jdbc") because the source is a relational Azure SQL database.
+
+Through dbtable, we specify dbo.aircraft_master, where dbo is the schema and aircraft_master is the source table.
+
+We then provide the credentials and Microsoft SQL Server JDBC driver and call .load(). This loads the source data into a Spark DataFrame called aircraft_df.
+
+Finally, display(aircraft_df) allows us to inspect the loaded data.
+
+We have wrapped the operation inside a try-except block so that if the JDBC connection or read operation fails, the notebook captures the exception and prints up to the first 2,000 characters of the error instead of displaying an excessively long error message.”
+
+All of these settings and operations appear directly in the notebook.
+
+SME may ask: Why Secret Scope?
+
+Answer:
+
+“Secret Scope prevents credentials from being hardcoded in the notebook. The notebook retrieves the credentials at runtime using dbutils.secrets.get(), which is more secure than storing the username and password directly in code.”
+
+Why JDBC?
+
+“Because our source is Azure SQL, which is a relational database. Spark can connect to it through JDBC and load the SQL table directly into a Spark DataFrame.”
+
+Why 1433?
+
+“1433 is the standard SQL Server/Azure SQL database connection port.”
+
+What does .load() do?
+
+“.load() actually executes the JDBC read and creates the Spark DataFrame.”
+
+Cell 2: Read airline_master
+Python
+# COMMAND ----------
+# DBTITLE 1,Read airline_master from Azure SQL
+jdbc_url = (
+"jdbc:sqlserver://capstone3server.database.windows.net:1433;"
+"database=capstone3;"
+"encrypt=true;"
+"trustServerCertificate=false;"
+"hostNameInCertificate=*.database.windows.net;"
+"loginTimeout=30;"
+)
+try:
+airline_df = (spark.read
+.format("jdbc")
+.option("url", jdbc_url)
+.option("dbtable", "dbo.airline_master")
+.option("user", sql_user)
+.option("password", sql_password)
+.option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")
+.load())
+display(airline_df)
+except Exception as e:
+print(str(e)[:2000])
+Transcript
+
+“In the second cell, we follow the same JDBC ingestion pattern, but this time we read the airline master table.
+
+The JDBC URL connects to the same Azure SQL database. Since sql_user and sql_password were already retrieved in the previous cell, we reuse those variables here.
+
+The main difference is dbtable, where we specify dbo.airline_master.
+
+Spark loads this table into a DataFrame called airline_df, and we display it to verify the loaded records.
+
+Again, the operation is wrapped inside a try-except block for error handling.”
+
+If SME asks: Why recreate jdbc_url?
+
+You can safely say:
+
+“The connection URL is defined again in this cell, although it points to the same Azure SQL database. Functionally, we could define the JDBC URL once and reuse it across all three reads. In this notebook it has been repeated to keep each ingestion section independently readable.”
+
+That is a good answer because it explains the code rather than claiming the repetition is technically necessary.
+
+Cell 3: Read airport_master
+Python
+# COMMAND ----------
+# DBTITLE 1,Read airport_master from Azure SQL
+jdbc_url = (
+"jdbc:sqlserver://capstone3server.database.windows.net:1433;"
+"database=capstone3;"
+"encrypt=true;"
+"trustServerCertificate=false;"
+"hostNameInCertificate=*.database.windows.net;"
+"loginTimeout=30;"
+)
+try:
+airport_df = (spark.read
+.format("jdbc")
+.option("url", jdbc_url)
+.option("dbtable", "dbo.airport_master")
+.option("user", sql_user)
+.option("password", sql_password)
+.option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")
+.load())
+display(airport_df)
+except Exception as e:
+print(str(e)[:2000])
+Transcript
+
+“Similarly, in the third cell we load the airport master reference data.
+
+We use the same JDBC connection configuration and credentials, but change the source table to dbo.airport_master.
+
+Once .load() executes, the Azure SQL table becomes a Spark DataFrame called airport_df.
+
+We display the DataFrame to verify the ingestion, and once again use exception handling so that connection or read failures can be captured and diagnosed.”
+
+Cell 4: Persist all three as Delta tables
+Python
+# COMMAND ----------
+aircraft_df.write.format("delta").mode("overwrite").saveAsTable("capstone_3flight.flight_schema.aircraft_master")
+airline_df.write.format("delta").mode("overwrite").saveAsTable("capstone_3flight.flight_schema.airline_master")
+airport_df.write.format("delta").mode("overwrite").saveAsTable("capstone_3flight.flight_schema.airport_master")
+print("Aircraft:", spark.table("capstone_3flight.flight_schema.aircraft_master").count())
+print("Airline:", spark.table("capstone_3flight.flight_schema.airline_master").count())
+print("Airport:", spark.table("capstone_3flight.flight_schema.airport_master").count())
+Transcript
+
+“After successfully reading all three master datasets from Azure SQL, the final cell persists them as Delta tables in Databricks.
+
+For each DataFrame, we use .write.format("delta"), so the destination is stored in Delta format.
+
+We use mode("overwrite"), which means that when this notebook is rerun, the existing target table is replaced with the latest version of the source master data.
+
+Finally, saveAsTable() registers and stores each dataset as a table under the capstone_3flight.flight_schema namespace.
+
+So aircraft_df becomes aircraft_master, airline_df becomes airline_master, and airport_df becomes airport_master.
+
+At the end, we read each saved table using spark.table() and perform .count(). These counts provide a basic validation that the tables have been successfully persisted and allow us to verify the number of rows available in each target table.”
+
+Very important SME questions from this cell
+1. Why Delta format?
+
+Say:
+
+“We store the ingested data in Delta format so that the datasets can be managed as Databricks tables and can benefit from Delta Lake capabilities such as ACID transactions and reliable table operations.”
+
+2. Why overwrite instead of append?
+
+For your notebook, a safe answer is:
+
+“These are master or reference datasets rather than continuously arriving flight-event records. Our implementation takes the current source snapshot and overwrites the target table on each run, so the Databricks copy reflects the latest version loaded from Azure SQL.”
+
+Your code explicitly uses mode("overwrite").
+
+3. Is this incremental ingestion?
+
+“No. In this particular notebook we are not implementing incremental ingestion. We read the source master tables and overwrite the corresponding Delta tables.”
+
+That's important because your code does not contain watermarking or incremental filtering.
+
+4. Is Auto Loader being used here?
+
+“No. Auto Loader is not being used in this notebook. These datasets come from Azure SQL and therefore we use JDBC. Auto Loader is applicable to our file-based ingestion scenario.”
+
+5. Is this streaming?
+
+“No. This is batch ingestion. We use spark.read, not spark.readStream.”
+
+6. Where are username and password stored?
+
+“They are retrieved from the Databricks Secret Scope named capstone3 using the keys sql-user and sql-password. They aren't hardcoded in the notebook.”
+
+7. Why are aircraft, airline and airport called master/reference tables?
+
+A good project explanation is:
+
+“They contain descriptive/reference information that our operational flight data can refer to. They are different from continuously generated operational events such as flight movement or status data.”
+
+Important point SME may catch
+
+Notice this structure:
+
+Python
+try:
+aircraft_df = ...
+except Exception as e:
+print(...)
+
+but afterwards:
+
+Python
+aircraft_df.write...
+
+If the JDBC read fails, aircraft_df might not have been successfully created, but the notebook only prints the exception and continues.
+
+So if SME asks“Is the error handling perfect?”, don't say yes.
+
+Say:
+
+“The current implementation provides basic exception logging. One improvement would be to fail the notebook explicitly after a critical ingestion failure rather than only printing the exception, because downstream cells expect these DataFrames to exist.”
+
+That is a strong production-awareness answer.
+
+1-minute version to memorize
+
+If you don't have time to explain every line, memorize this:
+
+“This notebook handles ingestion of our three reference datasets, aircraft master, airline master, and airport master, from Azure SQL into Databricks.
+
+First, we securely retrieve the Azure SQL username and password from the Databricks Secret Scope instead of hardcoding credentials.
+
+Then we establish the Azure SQL connection using JDBC and use spark.read.format("jdbc") to read each SQL table into its respective Spark DataFrame.
+
+The reads are wrapped in try-except blocks for basic error handling.
+
+Once the three datasets are loaded, we persist them as Delta tables under our capstone_3flight.flight_schema namespace. We use overwrite mode because this implementation reloads the current master-data snapshot rather than performing incremental ingestion.
+
+Finally, we calculate the record count of each saved Delta table as a basic source-to-target validation.
+
+So overall, this notebook securely brings our Azure SQL reference data into Databricks and makes it available as Delta tables for downstream processing.”
+
+Best transition to your next Bronze notebook
+
+“With this, our Azure SQL master-data ingestion is complete. We now have the aircraft, airline, and airport reference datasets available as Delta tables in Databricks. Next, I’ll move to our file-based Bronze ingestion, where the operational datasets are ingested from our storage layer.”
+
+Why this version is SME-safe
+
+I kept the explanation tied directly to what your notebook actually implements: Secret Scope → JDBC → Spark DataFrames → Delta tables → count validation. I also avoided claiming features that are not present here, such as Auto Loader, streaming, watermarking, or incremental ingestion.

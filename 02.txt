@@ -1,0 +1,645 @@
+02
+_bronze_adls_ingestion - SME Presentation Transcript
+Opening transcript
+
+“Now I’ll explain our second Bronze-layer notebook. In the previous notebook, we ingested the aircraft, airline, and airport master reference data from Azure SQL.
+
+In this notebook, our objective is to ingest the operational CSV files available in the Unity Catalog volume into Bronze Delta tables.
+
+We are using Databricks Auto Loader with cloudFiles for this ingestion. We have three datasets: flight schedules, flight movement events, and weather observations.
+
+The Bronze layer is designed to preserve the source data, so we are not performing business transformations, joins, deduplication, or metric calculations here. We only add ingestion metadata such as source file and ingestion timestamp, while Auto Loader also maintains rescued data for values that cannot be placed into the expected schema.”
+
+Cell 1: Configure catalog, schema and volume
+Python
+# Unity Catalog names from the current workspace structure
+CATALOG = "capstone_3flight"
+SCHEMA = "flight_schema"
+VOLUME = "ext_capstone3_vol"
+ 
+# Fully qualified names
+SCHEMA_NAME = f"{CATALOG}.{SCHEMA}"
+VOLUME_ROOT = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}"
+ 
+# Persistent Auto Loader state is stored inside the volume.
+STATE_ROOT = f"{VOLUME_ROOT}/_autoloader_state/bronze"
+ 
+print("Catalog and schema :", SCHEMA_NAME)
+print("Volume root :", VOLUME_ROOT)
+print("Auto Loader state :", STATE_ROOT)
+What to say
+
+“In the first cell, we define the Unity Catalog locations that will be used throughout the notebook.
+
+CATALOG represents our catalog, SCHEMA represents the schema, and VOLUME represents the Unity Catalog volume containing our source data.
+
+Then we construct SCHEMA_NAME, which gives us the fully qualified catalog and schema name.
+
+VOLUME_ROOT gives us the root path of our Unity Catalog volume.
+
+Finally, we define STATE_ROOT. This is important because Auto Loader needs persistent locations to maintain schema information and checkpoint information for each dataset.
+
+By defining these values once at the beginning, we can reuse them throughout the notebook instead of hardcoding the paths repeatedly.”
+
+SME: What is f before the string?
+
+“It is a Python f-string. It allows us to dynamically insert variable values into a string.”
+
+For example:
+
+Python
+SCHEMA_NAME = f"{CATALOG}.{SCHEMA}"
+
+becomes:
+
+capstone_3flight.flight_schema
+
+Cell 2: Verify source CSV files
+Python
+import fnmatch
+ 
+SOURCE_CONFIG = {
+"flight_schedules": {
+"path": f"{VOLUME_ROOT}/flight_schedules",
+"pattern": "*.csv",
+},
+"flight_movement_events": {
+"path": f"{VOLUME_ROOT}/event_data",
+"pattern": "flight_movement_events*.csv",
+},
+"weather_observations": {
+"path": f"{VOLUME_ROOT}/event_data",
+"pattern": "weather_observations*.csv",
+},
+}
+ 
+def list_matching_csv_files(folder_path, file_pattern):
+# dbutils.fs.ls raises an error if the folder does not exist.
+files = dbutils.fs.ls(folder_path)
+return [
+item.path
+for item in files
+if not item.isDir() and fnmatch.fnmatch(item.name, file_pattern)
+]
+ 
+for dataset_name, config in SOURCE_CONFIG.items():
+try:
+matching_files = list_matching_csv_files(
+config["path"],
+config["pattern"]
+)
+except Exception as error:
+raise RuntimeError(
+f"Source folder is missing or cannot be accessed: {config['path']}. "
+"Check the folder in the Unity Catalog volume."
+) from error
+ 
+if not matching_files:
+raise RuntimeError(
+f"No files matching '{config['pattern']}' were found in "
+f"{config['path']}. Check the uploaded file names and folder."
+)
+ 
+print(f"PASS | {dataset_name}: {len(matching_files)} matching CSV file(s)")
+for file_path in matching_files[:5]:
+print(" ", file_path)
+if len(matching_files) > 5:
+print(" ...")
+What to say
+
+“Before starting ingestion, we validate that the expected source folders and CSV files actually exist.
+
+First, fnmatch is imported. We use it to compare each filename against the expected filename pattern.
+
+Then, SOURCE_CONFIG stores the source path and expected filename pattern for each of our three datasets.
+
+For flight schedules, any CSV file inside the flight_schedules folder is accepted.
+
+Flight movement events and weather observations are both present inside the event_data folder, so we distinguish them using filename prefixes.
+
+Next, list_matching_csv_files() lists the contents of the folder using dbutils.fs.ls(). We exclude directories using item.isDir() and use fnmatch.fnmatch() to select only filenames matching our required pattern.
+
+We then loop through all three configurations.
+
+If a folder cannot be accessed, we deliberately stop the notebook using RuntimeError.
+
+Similarly, if the folder exists but there are no matching files, the notebook also stops.
+
+This is a fail-fast validation. Instead of continuing with an incorrect or missing source, we identify the problem before beginning ingestion.”
+
+Why [:5]?
+
+“It only controls how many matching file paths we print for inspection. It does not mean that only five files are processed.”
+
+Very important distinction.
+
+Cell 3: Check reference/master tables
+Python
+REFERENCE_TABLES = [
+f"{SCHEMA_NAME}.aircraft_master",
+f"{SCHEMA_NAME}.airline_master",
+f"{SCHEMA_NAME}.airport_master",
+]
+ 
+reference_check = []
+ 
+for table_name in REFERENCE_TABLES:
+if not spark.catalog.tableExists(table_name):
+raise RuntimeError(
+f"Required reference table does not exist: {table_name}. "
+"Run 01_azure_sql_ingestion first."
+)
+ 
+row_count = spark.table(table_name).count()
+ 
+# The reference tables are expected to be Delta tables.
+history_row = (
+spark.sql(f"DESCRIBE HISTORY {table_name} LIMIT 1")
+.select("version")
+.first()
+)
+latest_version = history_row["version"] if history_row else None
+ 
+reference_check.append(
+(table_name, row_count, latest_version)
+)
+ 
+display(
+spark.createDataFrame(
+reference_check,
+["table_name", "row_count", "latest_delta_version"]
+)
+)
+What to say
+
+“Before processing our operational datasets, we perform a read-only validation of the three reference tables created by the previous Azure SQL ingestion notebook.
+
+We first create a list containing aircraft master, airline master, and airport master.
+
+For every table, spark.catalog.tableExists() confirms that the table exists.
+
+If a required reference table doesn't exist, we stop the notebook and instruct the user to run the first ingestion notebook.
+
+For existing tables, we calculate the row count.
+
+Then we use DESCRIBE HISTORY to retrieve the latest Delta version.
+
+We store the table name, row count, and latest Delta version inside reference_check.
+
+Finally, we convert those results into a Spark DataFrame and display them.
+
+One important point is that this cell is only validating the reference tables. It does not modify them.”
+
+SME: Why check Delta version?
+
+“It gives us a quick check that the reference table has Delta history and lets us see its latest version.”
+
+SME: Are master tables ingested again here?
+
+“No. They were loaded separately by the first Azure SQL ingestion notebook. Here we only validate them.”
+
+Cell 4: Reusable Auto Loader function
+
+This is the most important cell in this notebook.
+
+Python
+from pyspark.sql import functions as F
+ 
+def ingest_to_bronze(dataset_name, source_path, file_pattern, target_table):
+schema_path = f"{STATE_ROOT}/{dataset_name}/schema"
+checkpoint_path = f"{STATE_ROOT}/{dataset_name}/checkpoint"
+ 
+# Auto Loader reads CSV files incrementally.
+source_df = (
+spark.readStream
+.format("cloudFiles")
+.option("cloudFiles.format", "csv")
+.option("cloudFiles.schemaLocation", schema_path)
+.option("cloudFiles.schemaEvolutionMode", "addNewColumns")
+.option("cloudFiles.inferColumnTypes", "false")
+.option("cloudFiles.rescuedDataColumn", "_rescued_data")
+.option("header", "true")
+.option("pathGlobFilter", file_pattern)
+.load(source_path)
+)
+ 
+# Add ingestion metadata. No business transformations are performed.
+bronze_df = (
+source_df
+.withColumn("_source_file", F.col("_metadata.file_path"))
+.withColumn("_ingested_at", F.current_timestamp())
+)
+ 
+# Append to the Bronze Delta table and retain stream progress.
+query = (
+bronze_df.writeStream
+.format("delta")
+.outputMode("append")
+.option("checkpointLocation", checkpoint_path)
+.option("mergeSchema", "true")
+.trigger(availableNow=True)
+.toTable(target_table)
+)
+ 
+# Important for Workflow jobs: do not finish the notebook before ingestion ends.
+query.awaitTermination()
+ 
+print(f"PASS | Completed ingestion for {dataset_name}")
+print(f" Target table: {target_table}")
+ 
+Transcript
+
+“This is the core ingestion logic of the notebook.
+
+Instead of repeating almost identical Auto Loader code three times, we created one reusable function called ingest_to_bronze.
+
+The function accepts four parameters: dataset name, source path, file pattern, and target table.
+
+First, we create separate schema and checkpoint locations for each dataset.
+
+Then we use spark.readStream.format("cloudFiles"), which enables Databricks Auto Loader.
+
+cloudFiles.format is CSV because our source files are CSV files.
+
+cloudFiles.schemaLocation provides Auto Loader a persistent location for tracking the discovered schema.
+
+cloudFiles.schemaEvolutionMode is set to addNewColumns, allowing Auto Loader to detect newly introduced source columns.
+
+cloudFiles.inferColumnTypes is false, so Auto Loader does not attempt to infer each CSV column's data type here. This is suitable for our Bronze design because we want to preserve the raw source representation and handle business-level typing later.
+
+_rescued_data is configured as the rescued-data column. If Auto Loader encounters values or fields that cannot be placed into the expected schema, that information can be preserved there rather than simply being lost.
+
+header=true tells Spark that the first row contains the column names.
+
+pathGlobFilter ensures that each ingestion stream reads only files matching that dataset's filename pattern.
+
+After reading the source, we add two metadata columns. _source_file records where each record originated using _metadata.file_path, while _ingested_at captures the ingestion timestamp.
+
+We then write the DataFrame as Delta using writeStream. outputMode("append") means new records are appended to the Bronze table.
+
+Each stream gets its own checkpoint location. The checkpoint records streaming progress and is what helps prevent already committed files from being processed again on subsequent runs.
+
+mergeSchema=true allows the destination Delta table to accept schema additions after Auto Loader detects new source columns.
+
+Finally, availableNow=True tells the stream to process the currently available data and then stop rather than run continuously.
+
+awaitTermination() makes the notebook wait until that ingestion stream has completed before proceeding.”
+
+Critical difference: schemaLocation vs checkpointLocation
+
+Memorize this because an SME can definitely ask.
+
+schemaLocation
+
+“Schema location tracks information about the source schema detected by Auto Loader.”
+
+checkpointLocation
+
+“Checkpoint location tracks the stream's processing progress so Auto Loader knows what it has already processed.”
+
+Easy memory trick:
+
+Schema location = what does the incoming data look like?
+
+Checkpoint = how far has ingestion progressed?
+
+addNewColumns vs mergeSchema
+
+Another important counter-question.
+
+“cloudFiles.schemaEvolutionMode="addNewColumns" handles newly discovered columns on the Auto Loader/source side.
+
+mergeSchema="true" allows those additional columns to be accepted by the destination Delta table.”
+
+So remember:
+
+Auto Loader input → addNewColumns
+
+Delta output → mergeSchema
+
+The notebook itself notes that a newly detected source column can cause the current run to stop with a schema-evolution exception, after which a workflow retry can restart using the evolved schema.
+
+Cell 5: Table and checkpoint safety check
+Python
+def path_has_files(path):
+try:
+return len(dbutils.fs.ls(path)) > 0
+except Exception:
+return False
+ 
+def check_table_checkpoint_state(target_table, checkpoint_path):
+table_exists = spark.catalog.tableExists(target_table)
+checkpoint_has_files = path_has_files(checkpoint_path)
+ 
+table_has_rows = False
+if table_exists:
+table_has_rows = spark.table(target_table).limit(1).count() > 0
+ 
+if table_has_rows and not checkpoint_has_files:
+raise RuntimeError(
+f"Safety stop: {target_table} contains data, but its checkpoint "
+f"is missing or empty: {checkpoint_path}. Do not restart ingestion "
+"with a new checkpoint until the state has been investigated."
+)
+ 
+if checkpoint_has_files and not table_exists:
+raise RuntimeError(
+f"Safety stop: checkpoint data exists at {checkpoint_path}, "
+f"but target table {target_table} does not exist. Investigate "
+"the table/checkpoint state before proceeding."
+)
+ 
+print(
+f"PASS | State check for {target_table} "
+f"(table_exists={table_exists}, "
+f"table_has_rows={table_has_rows}, "
+f"checkpoint_has_files={checkpoint_has_files})"
+)
+What to say
+
+“This cell introduces an important safety check between the Bronze Delta table and its checkpoint.
+
+path_has_files() checks whether the checkpoint path contains any files.
+
+Then check_table_checkpoint_state() checks three things: whether the target table exists, whether it contains records, and whether checkpoint information exists.
+
+If the Bronze table already contains records but the checkpoint is missing, we stop the process. Otherwise, starting ingestion with a new checkpoint could cause previously processed files to be treated as new and create duplicate ingestion.
+
+We also check the opposite situation. If checkpoint data exists but the target table is missing, the checkpoint and Delta table are inconsistent, so we also stop ingestion.
+
+The purpose is to fail safely rather than silently continue with an inconsistent ingestion state.”
+
+SME: Why .limit(1).count() instead of .count()?
+
+Good answer:
+
+“We only need to determine whether at least one row exists. We don't need the total row count for this particular validation.”
+
+Cell 6: Flight schedules ingestion
+Python
+flight_schedules_table = f"{SCHEMA_NAME}.bronze_flight_schedules"
+flight_schedules_checkpoint = f"{STATE_ROOT}/flight_schedules/checkpoint"
+ 
+check_table_checkpoint_state(
+flight_schedules_table,
+flight_schedules_checkpoint
+)
+ 
+ingest_to_bronze(
+dataset_name="flight_schedules",
+source_path=SOURCE_CONFIG["flight_schedules"]["path"],
+file_pattern=SOURCE_CONFIG["flight_schedules"]["pattern"],
+target_table=flight_schedules_table
+)
+Transcript
+
+“Now we begin the actual ingestion.
+
+First, we define the target table as bronze_flight_schedules and define the corresponding checkpoint path.
+
+Before ingestion, we call our state-check function to ensure the checkpoint and target table are consistent.
+
+After that, we call our reusable ingest_to_bronze function and pass the flight-schedule source path, filename pattern, and target table.
+
+This processes the currently available matching schedule files and appends their records into the Bronze flight schedules Delta table.”
+
+Cell 7: Flight movement events
+Python
+flight_movement_table = f"{SCHEMA_NAME}.bronze_flight_movement_events"
+flight_movement_checkpoint = f"{STATE_ROOT}/flight_movement_events/checkpoint"
+ 
+check_table_checkpoint_state(
+flight_movement_table,
+flight_movement_checkpoint
+)
+ 
+ingest_to_bronze(
+dataset_name="flight_movement_events",
+source_path=SOURCE_CONFIG["flight_movement_events"]["path"],
+file_pattern=SOURCE_CONFIG["flight_movement_events"]["pattern"],
+target_table=flight_movement_table
+)
+Transcript
+
+“The same reusable ingestion process is applied to flight movement events.
+
+We define a separate Bronze target table and, importantly, a separate checkpoint.
+
+We perform the safety validation first and then call ingest_to_bronze.
+
+Although flight movement events and weather observations come from the same event_data folder, the filename pattern ensures that this stream selects only the files starting with flight_movement_events.”
+
+Cell 8: Weather observations
+Python
+weather_table = f"{SCHEMA_NAME}.bronze_weather_observations"
+weather_checkpoint = f"{STATE_ROOT}/weather_observations/checkpoint"
+ 
+check_table_checkpoint_state(
+weather_table,
+weather_checkpoint
+)
+ 
+ingest_to_bronze(
+dataset_name="weather_observations",
+source_path=SOURCE_CONFIG["weather_observations"]["path"],
+file_pattern=SOURCE_CONFIG["weather_observations"]["pattern"],
+target_table=weather_table
+)
+ 
+Transcript
+
+“We repeat the same controlled ingestion pattern for weather observations.
+
+Weather receives its own Bronze table, schema-tracking directory, and checkpoint.
+
+The filename filter selects only the weather_observations CSV files from event_data.
+
+Keeping independent stream state is important because each dataset has its own ingestion progress and potentially its own evolving schema.”
+
+Cell 9: Validate Bronze tables
+Python
+BRONZE_TABLES = [
+f"{SCHEMA_NAME}.bronze_flight_schedules",
+f"{SCHEMA_NAME}.bronze_flight_movement_events",
+f"{SCHEMA_NAME}.bronze_weather_observations",
+]
+ 
+bronze_results = []
+ 
+for table_name in BRONZE_TABLES:
+if not spark.catalog.tableExists(table_name):
+raise RuntimeError(f"Bronze table was not created: {table_name}")
+ 
+row_count = spark.table(table_name).count()
+bronze_results.append((table_name, row_count))
+ 
+display(
+spark.createDataFrame(
+bronze_results,
+["bronze_table", "total_rows"]
+)
+)
+Transcript
+
+“After completing all three ingestion streams, we validate our Bronze target tables.
+
+We create a list containing the three expected Bronze tables.
+
+For each table, spark.catalog.tableExists() verifies that the target was successfully created.
+
+If any expected table doesn't exist, we deliberately fail the notebook.
+
+For existing tables, we calculate the total record count and store the result in bronze_results.
+
+Finally, we convert these validation results into a DataFrame and display the table name with its total row count.
+
+This gives us a basic verification that our Bronze tables were created and contain the ingested data.”
+
+Be careful if SME asks:
+
+“Does row count alone prove source-to-target reconciliation?”
+
+Say:
+
+“No. This is a basic target validation. More detailed source-to-target reconciliation and profiling would require additional checks, which are handled separately.”
+
+This is safer than claiming the cell provides complete reconciliation.
+
+Cell 10: Inspect Bronze data
+Python
+display(
+spark.table(f"{SCHEMA_NAME}.bronze_flight_schedules")
+.limit(10)
+)
+Transcript
+
+“Finally, we inspect a small sample of the Bronze flight schedules table.
+
+spark.table() reads the saved Delta table and .limit(10) restricts the display to ten records.
+
+This cell is purely for inspection. It allows us to visually verify the source columns along with our added ingestion metadata, and it does not modify the table.”
+
+Cell 11: Expected rerun behavior
+
+This final Markdown section is also important because SME may ask what happens the second time the job executes.
+
+Present it like this:
+
+“One of the main advantages of this design is rerun behavior.
+
+If we execute the notebook again without adding new files, Auto Loader uses its maintained state and should not ingest the already committed files again.
+
+If new CSV files arrive, they are discovered and appended to the corresponding Bronze Delta table.
+
+If a new source column appears, Auto Loader's addNewColumns schema-evolution behavior can update its tracked schema. The current run may stop with a schema-evolution exception, and our workflow retry can restart using the updated schema.
+
+If incoming data cannot fit the expected schema, we can investigate _rescued_data.
+
+Most importantly, we should not delete or change the checkpoint just to force reruns, because the checkpoint represents ingestion progress and changing it can result in previously processed files being ingested again.”
+
+The notebook recommends a Workflow with maximum concurrent runs of 1, 2 retries, and a 1-minute minimum retry interval after manual testing.
+
+Top SME counter-questions you should memorize
+1. What exactly is Auto Loader?
+
+“Auto Loader is the Databricks file ingestion mechanism used here through cloudFiles. It incrementally discovers and processes new files while maintaining ingestion state.”
+
+2. Why readStream if this job eventually stops?
+
+“Because Auto Loader uses Spark Structured Streaming APIs for incremental file ingestion. availableNow=True tells the stream to process the currently available files and then terminate instead of continuously waiting for future files.”
+
+3. What is availableNow=True?
+
+“Process everything currently available, then stop.”
+
+New file tomorrow → next job execution processes it.
+
+4. What does awaitTermination() do?
+
+“It makes the notebook wait until the current availableNow stream finishes. Without this wait, the notebook could continue before the ingestion query has completed.”
+
+5. What does checkpoint store?
+
+“It stores streaming progress and helps Auto Loader determine what has already been processed.”
+
+6. What does schema location store?
+
+“It maintains Auto Loader's tracked source-schema information.”
+
+7. What is _rescued_data?
+
+“It is used to retain data that Auto Loader cannot place into the expected schema, which helps prevent problematic information from simply being discarded.”
+
+8. If _rescued_data is NULL for every row, what does it mean?
+
+“For those rows, Auto Loader did not need to place any incompatible or unexpected data into _rescued_data.”
+
+It does not mean all other columns have no nulls.
+
+That's an important distinction.
+
+9. Is deduplication happening?
+
+“No. We deliberately preserve the Bronze source data. This notebook does not perform business-record deduplication.”
+
+10. Is CDC implemented here?
+
+“No. CDC is not implemented in this notebook.”
+
+11. Is there a watermark?
+
+“No. We aren't using event-time watermarking in this notebook. Our file-processing progress is managed through the Auto Loader streaming state and checkpoint.”
+
+12. Why append?
+
+“Bronze is preserving incoming records. As newly discovered files arrive, their records are appended rather than replacing previously ingested Bronze data.”
+
+13. Why separate checkpoints?
+
+“Each dataset is an independent ingestion stream. Separate checkpoints prevent the processing state of flight schedules, flight movements, and weather observations from interfering with one another.”
+
+14. What happens if the same old file remains in the source folder?
+
+“Auto Loader uses its maintained state to identify previously processed files, so simply leaving an already committed file in the source location should not cause it to be ingested again on the next normal execution.”
+
+15. What if you delete the checkpoint?
+
+“We should not do that casually. The checkpoint represents ingestion progress. Starting an existing Bronze table with a new checkpoint can cause previously processed files to be treated as new and create duplicate ingestion. That is exactly why this notebook contains the table/checkpoint safety check.”
+
+2-minute memorization transcript
+
+If your presentation time is short, memorize this version:
+
+“This is our second Bronze-layer notebook, responsible for ingesting three operational CSV datasets: flight schedules, flight movement events, and weather observations.
+
+First, we configure our Unity Catalog, schema, source volume, and Auto Loader state location.
+
+Before starting ingestion, we validate the expected folders and filenames. We also perform a read-only validation of the aircraft, airline, and airport master tables that were loaded by our previous Azure SQL ingestion notebook.
+
+For ingestion, we created one reusable function using Databricks Auto Loader with cloudFiles. Each dataset has its own schema location and checkpoint location.
+
+Schema location maintains the detected source schema, whereas checkpoint location maintains ingestion progress.
+
+We use addNewColumns for source-side schema evolution and mergeSchema so that the destination Delta table can accept additional columns.
+
+We also maintain _rescued_data for information that cannot be placed into the expected schema, _source_file for source traceability, and _ingested_at for ingestion timestamp.
+
+The Bronze tables use append mode because we want to preserve incoming source records without applying business transformations.
+
+We use availableNow=True, meaning Auto Loader processes all currently available files and then stops. awaitTermination() ensures that each ingestion stream completes before the notebook proceeds.
+
+Before every ingestion, we also validate consistency between the table and its checkpoint to reduce the risk of accidental duplicate ingestion caused by lost checkpoint state.
+
+Finally, we validate that all three Bronze Delta tables exist, calculate their row counts, and inspect sample Bronze records.
+
+Therefore, the overall purpose of this notebook is to provide controlled, incremental and restart-aware ingestion of our operational CSV data into the Bronze layer while preserving source data and ingestion metadata.”
+
+Best transition to your profiling notebook
+
+Since your next notebook is the Bronze profiling notebook, end this one like this:
+
+“With this, our Bronze ingestion is complete. We now have the flight schedules, flight movement events, and weather observations persisted as Bronze Delta tables along with ingestion metadata. The next step is to profile and validate these Bronze datasets for data-quality issues before they move further through the lakehouse. So now I’ll move to our Bronze profiling notebook.”
+
+Presentation improvement
+
+I’ve deliberately separated what your code actually does from what might merely be possible in Databricks. For SME questions, especially remember these five distinctions: schema location vs checkpoint, addNewColumns vs mergeSchema, Auto Loader file tracking vs record-level deduplication, availableNow vs continuous streaming, and _rescued_data vs ordinary null values. Those are the areas most likely to generate follow-up questions.
